@@ -102,10 +102,10 @@ class TerminalBufferTest {
      */
     @Test
     fun testScrollback() {
-        // 3-row screen; writing 4 lines forces 1 line into scrollback.
+        // 3-row screen, writing 4 lines forces 1 line into scrollback.
         val buffer = TerminalBuffer(width = 20, height = 3, maxScrollback = 100)
 
-        // Each \n triggers newLine(); the 3rd \n causes a scroll because cursorY is
+        // Each \n triggers newLine(), the 3rd \n causes a scroll because cursorY is
         // already at the bottom row (2).
         buffer.write("Line1\nLine2\nLine3\nLine4")
 
@@ -155,5 +155,135 @@ class TerminalBufferTest {
         assertTrue(StylePacker.isBold(line0.style[0]),         "bold flag should be set")
         assertFalse(StylePacker.isItalic(line0.style[0]),      "italic flag should not be set")
         assertFalse(StylePacker.isUnderline(line0.style[0]),   "underline flag should not be set")
+    }
+
+    // ── testReflowWider ───────────────────────────────────────────────────────
+    /**
+     * Widening the terminal must merge two wrapped physical lines back into one
+     * logical line when the new width can accommodate all the content.
+     *
+     * Setup (width=40, height=5):
+     *   Write 50 'A's → line 0 filled (40 A's, isWrapped=true), 10 A's on line 1.
+     * Resize to width=80:
+     *   The single logical line (80 cells) fits in one new physical line.
+     *   Expect: getLine(0) has all 50 A's, isWrapped=false.
+     */
+    @Test
+    fun testReflowWider() {
+        val buffer = TerminalBuffer(width = 40, height = 5)
+        buffer.write("A".repeat(50))
+
+        // Sanity-check pre-resize state.
+        assertTrue(buffer.getLine(0).isWrapped, "pre-resize: line 0 should be wrapped")
+
+        buffer.resize(80, 5)
+
+        assertEquals(80, buffer.width,  "width should be 80 after resize")
+        assertEquals(5,  buffer.height, "height should remain 5")
+
+        val line0 = buffer.getLine(0)
+        assertEquals("A".repeat(50) + " ".repeat(30), line0.toString(),
+            "all 50 A's should fit on one line after widening")
+        assertFalse(line0.isWrapped,
+            "merged line should NOT be marked isWrapped (it is the end of its logical line)")
+
+        // Line 1 should now be blank (old overflow was pulled up).
+        assertTrue(buffer.getLine(1).toString().all { it == ' ' },
+            "line 1 should be blank after the two physical lines merged")
+    }
+
+    // ── testReflowNarrower ────────────────────────────────────────────────────
+    /**
+     * Narrowing the terminal must split one long physical line into two wrapped ones.
+     *
+     * Setup (width=80, height=5):
+     *   Write 80 'A's → fills line 0 exactly.
+     * Resize to width=40:
+     *   The 80-cell logical line re-slices into two chunks of 40.
+     *   Expect: line 0 = "A"*40 with isWrapped=true, line 1 starts with "A"*40.
+     */
+    @Test
+    fun testReflowNarrower() {
+        val buffer = TerminalBuffer(width = 80, height = 5)
+        buffer.write("A".repeat(80))
+
+        buffer.resize(40, 5)
+
+        assertEquals(40, buffer.width,  "width should be 40 after resize")
+        assertEquals(5,  buffer.height, "height should remain 5")
+
+        val line0 = buffer.getLine(0)
+        val line1 = buffer.getLine(1)
+
+        assertEquals("A".repeat(40), line0.toString(),
+            "first physical line should contain the first 40 A's")
+        assertTrue(line0.isWrapped,
+            "first physical line should be marked isWrapped=true (content continues)")
+
+        assertEquals("A".repeat(40), line1.toString(),
+            "second physical line should contain the remaining 40 A's")
+        assertFalse(line1.isWrapped,
+            "second physical line is the last chunk, so isWrapped must be false")
+    }
+
+    // ── testSimultaneousResize ────────────────────────────────────────────────
+    /**
+     * Changing both width and height simultaneously must preserve all text content
+     * and correctly redistribute lines between screen and scrollback.
+     *
+     * Setup (width=80, height=24):
+     *   Write 24 lines of 79 A's (each terminated with \n), then write "B".
+     *   → scrollback contains 1 line (the first A-line that was evicted on the 24th \n).
+     *   → screen[0..22] = A-lines, screen[23] = "B" + spaces.
+     *   → cursor at row 23, col 1.
+     *
+     * Resize to (width=40, height=10):
+     *   Each 80-cell logical line re-slices into two 40-cell chunks → 50 new lines total.
+     *   Last 10 go to screen, 40 go to scrollback.
+     *   The "B" line (logical 24) maps to screen[8] (chunk 0) and screen[9] (chunk 1).
+     */
+    @Test
+    fun testSimultaneousResize() {
+        val buffer = TerminalBuffer(width = 80, height = 24, maxScrollback = 1000)
+
+        // Write 24 hard lines of 79 A's + a single "B".
+        repeat(24) { buffer.write("A".repeat(79) + "\n") }
+        buffer.write("B")
+
+        // Verify pre-resize: one line evicted from screen.
+        assertEquals(1, buffer.getScrollbackSize(),
+            "pre-resize: exactly 1 line should be in scrollback")
+        assertEquals(23, buffer.cursorY, "pre-resize: cursor should be on last row")
+        assertEquals(1,  buffer.cursorX, "pre-resize: cursor should be at column 1")
+
+        buffer.resize(40, 10)
+
+        // Dimensions updated.
+        assertEquals(40, buffer.width,  "width should be 40 after resize")
+        assertEquals(10, buffer.height, "height should be 10 after resize")
+
+        // 25 logical lines × 2 chunks each = 50 physical lines.
+        // Last 10 go to screen, 40 go to scrollback.
+        assertEquals(40, buffer.getScrollbackSize(),
+            "scrollback should contain 40 lines after resize")
+
+        // Screen line 0 is the first chunk of logical line 20 (all A content).
+        assertTrue(buffer.getLine(0).toString().startsWith("A".repeat(40)),
+            "screen[0] should start with 40 A's")
+
+        // The 'B' line is screen[8] (first 40-cell chunk of the last logical line).
+        val bLine = buffer.getLine(8)
+        assertEquals('B', bLine.content[0],
+            "screen[8] should start with 'B'")
+        assertTrue(bLine.isWrapped,
+            "screen[8] should be isWrapped=true (content spills to screen[9])")
+
+        // screen[9] is the trailing-spaces chunk of the 'B' logical line.
+        assertTrue(buffer.getLine(9).toString().all { it == ' ' },
+            "screen[9] should be all spaces (trailing half of B-line after reflow)")
+
+        // Cursor should be on screen[8] at column 1 (right after 'B').
+        assertEquals(8, buffer.cursorY, "cursor row should be 8 after resize")
+        assertEquals(1, buffer.cursorX, "cursor column should remain at 1 after resize")
     }
 }

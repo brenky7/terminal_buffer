@@ -6,16 +6,25 @@
  *   packed per-cell via [StylePacker].
  * - Automatic line-wrapping with [TerminalLine.isWrapped] tracking.
  * - Scrollback history via an [ArrayDeque], bounded by [maxScrollback].
+ * 
+ * Adds simultaneous resize + reflow on top of the core logic:
+ * - [resize] merges scrollback + screen into logical lines (using [TerminalLine.isWrapped]),
+ *   re-slices them at the new width, and distributes them back anchored to the bottom.
+ * - The cursor is tracked through the reflow so its visual position is preserved.
  *
  * @param width         Number of columns (characters per line).
  * @param height        Number of rows visible on screen.
  * @param maxScrollback Maximum number of lines stored in history (default 1000).
  */
 class TerminalBuffer(
-    val width:         Int,
-    val height:        Int,
-    val maxScrollback: Int = 1000
+    width:              Int,
+    height:             Int,
+    val maxScrollback:  Int = 1000
 ) {
+    // Mutable so resize() can update them.
+    var width:  Int = width;  private set
+    var height: Int = height; private set
+
 
     // ── Active Screen ─────────────────────────────────────────────────────────
     // Fixed-capacity list, always contains exactly [height] lines.
@@ -25,7 +34,7 @@ class TerminalBuffer(
 
     // ── Scrollback ────────────────────────────────────────────────────────────
     // Lines that have scrolled off the top of the screen.
-    // Oldest entries are at the front; newest at the back.
+    // Oldest entries are at the front, newest at the back.
     private val scrollback: ArrayDeque<TerminalLine> = ArrayDeque()
 
     // ── Cursor state ──────────────────────────────────────────────────────────
@@ -174,4 +183,133 @@ class TerminalBuffer(
      */
     fun getScrollbackContent(): String =
         scrollback.joinToString("\n") { it.toString() }
+
+    // ── Resize & Reflow ───────────────────────────────────────────────────────
+
+    /**
+     * Resize the terminal to [newWidth] × [newHeight], reflowing all content.
+     *
+     * **Algorithm overview:**
+     * 1. Merge 
+     *      Scrollback and screen are concatenated into one ordered list of
+     *      physical lines (oldest first).
+     * 2. Build logical lines
+     *      Consecutive physical lines where [TerminalLine.isWrapped]
+     *      is `true` on the preceding line are joined into a single logical line represented
+     *      as flat cell arrays (char + style).
+     * 3. Re-slice 
+     *      Each logical line is chopped into chunks of [newWidth] cells.
+     *      Every chunk except the last is marked `isWrapped = true`.
+     * 4. Distribute - anchor to bottom 
+     *      The last [newHeight] new physical lines fill the screen.
+     *      Everything before them goes to scrollback (trimmed to [maxScrollback]).
+     *      Blank lines are appended to the screen when the total is less than [newHeight].
+     * 5. Cursor 
+     *      The cursor's absolute cell offset within its logical line is computed
+     *      before re-slicing, then mapped back to new (cursorY, cursorX) coordinates.
+     */
+    fun resize(newWidth: Int, newHeight: Int) {
+        require(newWidth  >= 1) { "newWidth must be >= 1" }
+        require(newHeight >= 1) { "newHeight must be >= 1" }
+        if (newWidth == width && newHeight == height) return
+
+        // ── 1. Merge ──────────────────────────────────────────────────────────
+        val merged = ArrayList<TerminalLine>(scrollback.size + screen.size)
+        merged.addAll(scrollback)
+        merged.addAll(screen)
+
+        val cursorMergedIdx = scrollback.size + cursorY
+
+        // Find the last meaningful physical line 
+        // Blank lines sitting below the cursor add no content, reflowing them would
+        // inflate newPhysical and push real content into scrollback unnecessarily.
+        // The reflow is stopped at lastMeaningfulIdx, blank tail rows are re-appended
+        // as fresh TerminalLine(newWidth) blanks during screen padding (step 4).
+        var lastMeaningfulIdx = cursorMergedIdx
+        for (j in cursorMergedIdx + 1 until merged.size) {
+            if (merged[j].content.any { it != ' ' }) lastMeaningfulIdx = j
+        }
+        // Never split a soft-wrapped logical group at the boundary.
+        while (lastMeaningfulIdx < merged.size - 1 && merged[lastMeaningfulIdx].isWrapped) {
+            lastMeaningfulIdx++
+        }
+
+        // ── 2. Build logical lines (merged[0..lastMeaningfulIdx]) ─────────────
+        var cursorLogicalLine     = 0
+        var cursorOffsetInLogical = 0
+
+        class Segment(val chars: CharArray, val styles: IntArray)
+        val logicals = ArrayList<Segment>(lastMeaningfulIdx + 1)
+
+        var idx = 0
+        while (idx <= lastMeaningfulIdx) {
+            val groupChars  = ArrayList<Char>(width  * 2)
+            val groupStyles = ArrayList<Int>(width * 2)
+            while (true) {
+                val phys = merged[idx]
+                if (idx == cursorMergedIdx) {
+                    cursorLogicalLine     = logicals.size
+                    cursorOffsetInLogical = groupChars.size + cursorX
+                }
+                for (col in 0 until phys.width) {
+                    groupChars.add(phys.content[col])
+                    groupStyles.add(phys.style[col])
+                }
+                val cont = phys.isWrapped
+                idx++
+                if (!cont || idx > lastMeaningfulIdx) break
+            }
+            logicals.add(Segment(groupChars.toCharArray(), groupStyles.toIntArray()))
+        }
+
+        // ── 3. Re-slice ───────────────────────────────────────────────────────
+        val newPhysical  = ArrayList<TerminalLine>(logicals.size * 2)
+        var newCursorPhysIdx = 0
+        var newCursorX       = 0
+
+        for ((logIdx, seg) in logicals.withIndex()) {
+            val total     = seg.chars.size
+            val startPhys = newPhysical.size
+
+            if (logIdx == cursorLogicalLine) {
+                val chunkIdx     = cursorOffsetInLogical / newWidth
+                newCursorPhysIdx = startPhys + chunkIdx
+                newCursorX       = cursorOffsetInLogical % newWidth
+            }
+
+            var offset = 0
+            while (offset < total) {
+                val chunkSize = minOf(newWidth, total - offset)
+                val newLine   = TerminalLine(newWidth)
+                for (col in 0 until chunkSize) {
+                    newLine.content[col] = seg.chars[offset + col]
+                    newLine.style[col]   = seg.styles[offset + col]
+                }
+                newLine.isWrapped = (offset + chunkSize < total)
+                newPhysical.add(newLine)
+                offset += chunkSize
+            }
+        }
+
+        // ── 4. Distribute - anchor to bottom ─────────────────────────────────
+        val totalNew    = newPhysical.size
+        val screenStart = maxOf(0, totalNew - newHeight)
+
+        scrollback.clear()
+        val sbFrom = maxOf(0, screenStart - maxScrollback)
+        for (j in sbFrom until screenStart) scrollback.addLast(newPhysical[j])
+
+        screen.clear()
+        for (j in screenStart until totalNew) screen.add(newPhysical[j])
+        // Blank-tail rows excluded from reflow come back as fresh blank lines.
+        while (screen.size < newHeight) screen.add(TerminalLine(newWidth))
+
+        // ── 5. Update cursor ──────────────────────────────────────────────────
+        cursorY = (newCursorPhysIdx - screenStart).coerceIn(0, newHeight - 1)
+        cursorX = newCursorX.coerceIn(0, newWidth  - 1)
+
+        // ── 6. Update dimensions ──────────────────────────────────────────────
+        width  = newWidth
+        height = newHeight
+    }
 }
