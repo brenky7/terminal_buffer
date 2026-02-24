@@ -2,8 +2,11 @@
  * Represents a single physical row in the terminal.
  *
  * Uses a Structure of Arrays pattern for data locality and memory efficiency:
- * - [content] stores the visible characters.
- * - [style]   stores packed style attributes (fg color, bg color, flags) per cell.
+ * - [content]   stores the visible characters.
+ * - [style]     stores attributes (foreground, background, flags) packed into integers
+ *               via [StylePacker].
+ * - [isWrapped] marks whether this line was soft-wrapped into the next physical row.
+ *               Used by the reflow algorithm in a later phase.
  *
  * @param width The number of columns in this line.
  */
@@ -14,6 +17,13 @@ class TerminalLine(val width: Int) {
 
     /** Style data for each cell, initialised to 0 (default/no style). */
     val style: IntArray = IntArray(width) { 0 }
+
+    /**
+     * True when this physical line was created by automatic line-wrapping (soft wrap),
+     * meaning the logical line continues on the next physical row.
+     * False when the line ends at a hard newline or is simply blank.
+     */
+    var isWrapped: Boolean = false
 
     /**
      * Writes a character and its style attribute at the given column [index].
