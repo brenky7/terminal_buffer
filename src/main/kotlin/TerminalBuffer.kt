@@ -32,18 +32,6 @@ class TerminalBuffer(
     var width:  Int = width;  private set
     var height: Int = height; private set
 
-
-    // ── Active Screen ─────────────────────────────────────────────────────────
-    // Fixed-capacity list, always contains exactly [height] lines.
-    private val screen: ArrayList<TerminalLine> = ArrayList<TerminalLine>(height).also { list ->
-        repeat(height) { list.add(TerminalLine(width)) }
-    }
-
-    // ── Scrollback ────────────────────────────────────────────────────────────
-    // Lines that have scrolled off the top of the screen.
-    // Oldest entries are at the front, newest at the back.
-    private val scrollback: ArrayDeque<TerminalLine> = ArrayDeque()
-
     // ── Cursor state ──────────────────────────────────────────────────────────
     /** Current cursor column (0-based). */
     var cursorX: Int = 0
@@ -53,7 +41,7 @@ class TerminalBuffer(
     var cursorY: Int = 0
         private set
 
-    // ── Pen / attribute state ─────────────────────────────────────────────────
+    // ── Pen attributes ────────────────────────────────────────────────────────
     /** Foreground ANSI color index applied to new characters (0-255). */
     var penFg: Int = 0
         private set
@@ -65,6 +53,14 @@ class TerminalBuffer(
     /** Current style flags (Bold / Italic / Underline) applied to new characters. */
     var penFlags: Int = 0
         private set
+
+    // ── Storage ───────────────────────────────────────────────────────────────
+    // Active screen: fixed-capacity list, always contains exactly [height] entries.
+    private val screen: ArrayList<TerminalLine> = ArrayList<TerminalLine>(height).also { list ->
+        repeat(height) { list.add(TerminalLine(width)) }
+    }
+    // Scrollback history: oldest entry at the front, newest at the back.
+    private val scrollback: ArrayDeque<TerminalLine> = ArrayDeque()
 
     /**
      * Set the current pen attributes.
@@ -90,7 +86,8 @@ class TerminalBuffer(
         if (italic)    penFlags = penFlags or StylePacker.ITALIC_FLAG
         if (underline) penFlags = penFlags or StylePacker.UNDERLINE_FLAG
     }
-    // ── Cursor control ─────────────────────────────────────────────────────
+
+    // ── Cursor control ────────────────────────────────────────────────────────
 
     /**
      * Move the cursor to ([x], [y]) on the screen.
@@ -112,6 +109,7 @@ class TerminalBuffer(
 
     /** Move the cursor right by [n] columns (clamped at the last column). */
     fun moveCursorRight(n: Int = 1) { cursorX = (cursorX + n).coerceAtMost(width - 1) }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /** The packed style Int built from the current pen state. */
